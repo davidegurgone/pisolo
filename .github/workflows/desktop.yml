@@ -1,0 +1,115 @@
+name: desktop (Windows + Linux)
+
+on:
+  push:
+    paths: ["desktop/**", ".github/workflows/desktop.yml"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: desktop
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: desktop/go.mod }
+      - run: go vet ./... && go test -v ./...
+      - run: go build -o pisolo .
+      - name: Mode 1 holds idle+sleep, mode 2 adds lid switch, both released on exit
+        run: |
+          set -x
+          check() { systemd-inhibit --list --no-pager | grep -i pisolo || true; }
+          sudo ./pisolo --headless --mode 1 & sleep 3
+          check; check | grep -q idle; check | grep -q sleep
+          set +e; sudo timeout 5 ./pisolo --headless --mode 1; rc=$?; set -e
+          [ "$rc" -eq 1 ]   # second copy must refuse to start (exit 1), not run (timeout = 124)
+          sudo pkill -INT -x pisolo; sleep 2
+          [ -z "$(check)" ]
+          sudo ./pisolo --headless --mode 2 & sleep 3
+          check | grep -q "handle-lid-switch"; check
+          sudo pkill -KILL -x pisolo; sleep 2
+          [ -z "$(check)" ]   # a crash releases the lock too
+          echo "Linux OK"
+      - name: Tray starts without crashing (Xvfb, no tray host)
+        run: |
+          sudo apt-get install -y xvfb dbus-x11 >/dev/null
+          xvfb-run -a dbus-launch ./pisolo --mode 0 & sleep 5
+          pgrep -x pisolo && pkill -INT -x pisolo
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: desktop/go.mod }
+      - run: go vet ./... ; go test -v ./...
+        shell: bash
+      - run: |
+          go build -o pisolo-cli.exe .
+          go build -ldflags "-H windowsgui" -o pisolo.exe .
+        shell: bash
+      - name: Modes, lid action and crash recovery
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Requests { powercfg /requests | Out-String }
+          function Lid { $q = powercfg /query SCHEME_CURRENT SUB_BUTTONS LIDACTION 2>&1 | Out-String
+                         $v = [regex]::Matches($q, '0x[0-9a-fA-F]{8}')
+                         if ($v.Count -lt 2) { return "" }
+                         return "$($v[$v.Count-2].Value) $($v[$v.Count-1].Value)" }
+          function Run($mode) { $p = Start-Process .\pisolo-cli.exe -ArgumentList "--headless","--mode",$mode -PassThru; Start-Sleep 3; return $p }
+
+          # Mode 1: system + display requests
+          $p = Run 1; $r = Requests; $r
+          if ($r -notmatch "(?s)DISPLAY:\s*\[PROCESS\][^\r\n]*pisolo") { throw "mode 1: no display request" }
+          if ($r -notmatch "(?s)SYSTEM:\s*\[PROCESS\][^\r\n]*pisolo")  { throw "mode 1: no system request" }
+          Stop-Process $p -Force; Start-Sleep 1
+
+          # Mode 2 without a lid (CI VMs have none): system request only, the screen may sleep
+          if ((Lid) -eq "") {
+            $p = Run 2; $r = Requests; $r
+            if ($r -notmatch "(?s)SYSTEM:\s*\[PROCESS\][^\r\n]*pisolo") { throw "mode 2: no system request" }
+            if ($r -match "(?s)DISPLAY:\s*\[PROCESS\][^\r\n]*pisolo")   { throw "mode 2: display kept on" }
+            Stop-Process $p -Force; Start-Sleep 1
+            "no lid: mode 2 holds system only, OK"
+            # Make the hidden lid setting visible, so the powercfg path can be tested too
+            powercfg -attributes SUB_BUTTONS LIDACTION -ATTRIB_HIDE 2>&1 | Out-Null
+          }
+
+          if ((Lid) -ne "") {
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 1
+            powercfg /setactive SCHEME_CURRENT
+            $before = Lid; "lid before: $before"
+            $p = Run 2; $during = Lid; "lid during mode 2: $during"
+            if ($during -ne "0x00000000 0x00000000") { throw "mode 2 did not set lid action to do nothing" }
+            Stop-Process $p -Force; Start-Sleep 1     # simulate a crash
+            $p = Run 0; $after = Lid; "lid after restart: $after"
+            if ($after -ne $before) { throw "crash recovery did not restore the lid action" }
+            Stop-Process $p -Force
+          } else {
+            "lid setting not available on this VM: powercfg path not testable here"
+          }
+
+          $g = Start-Process .\pisolo.exe -PassThru; Start-Sleep 5
+          if ($g.HasExited) { throw "tray app exited" }
+          Stop-Process $g -Force
+          "Windows OK"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [linux, windows]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: desktop/go.mod }
+      - run: sudo apt-get install -y zip >/dev/null && ./build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pisolo-desktop
+          path: |
+            desktop/dist/*.zip
+            desktop/dist/*.tar.gz
