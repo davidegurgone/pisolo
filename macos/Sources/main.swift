@@ -4,7 +4,11 @@
 import Cocoa
 import IOKit.pwr_mgt
 import IOKit.ps
+import Network
+import os
 import ServiceManagement
+
+let logger = Logger(subsystem: "com.davidegurgone.pisolo", category: "main")
 
 // MARK: - Modes
 
@@ -138,6 +142,54 @@ final class SleepController {
     }
 }
 
+// MARK: - Network
+
+/// Keeps the Mac online while it works unattended.
+///
+/// With the display asleep (lid closed, or idle), macOS stops trying to rejoin Wi-Fi
+/// after a couple of minutes and never asks a nearby iPhone to turn on its Personal
+/// Hotspot (Instant Hotspot): it does both again only when the display wakes up.
+/// So when the network has been down for a while, Pisolo declares user activity,
+/// which is what a key press would do, and macOS runs its auto-join again.
+final class NetworkKeeper {
+    private let monitor = NWPathMonitor()
+    private(set) var online = true
+    private var offlineSince: Date?
+    private var lastNudge = Date.distantPast
+    private let graceSeconds: TimeInterval = 20   // let macOS try on its own first
+    private let nudgeEvery: TimeInterval = 60
+
+    init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async { self?.update(path.status == .satisfied) }
+        }
+        monitor.start(queue: .global(qos: .utility))
+    }
+
+    private func update(_ isOnline: Bool) {
+        guard isOnline != online else { return }
+        online = isOnline
+        offlineSince = isOnline ? nil : Date()
+        logger.notice("network \(isOnline ? "up" : "down", privacy: .public)")
+    }
+
+    /// Called every few seconds while Pisolo is active.
+    func check() {
+        guard let since = offlineSince else { return }
+        let now = Date()
+        guard now.timeIntervalSince(since) >= graceSeconds,
+              now.timeIntervalSince(lastNudge) >= nudgeEvery else { return }
+        lastNudge = now
+        var id: IOPMAssertionID = 0
+        let r = IOPMAssertionDeclareUserActivity("Pisolo: reconnecting to the network" as CFString,
+                                                 kIOPMUserActiveLocal, &id)
+        logger.notice("offline for \(Int(now.timeIntervalSince(since)), privacy: .public)s, asked macOS to rejoin Wi-Fi (result \(r, privacy: .public))")
+        if r == kIOReturnSuccess {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { IOPMAssertionRelease(id) }
+        }
+    }
+}
+
 // MARK: - Battery
 
 func batteryLow() -> Bool {
@@ -161,7 +213,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let sleep = SleepController()
     private let defaults = UserDefaults.standard
     private var mode: Mode = .off
-    private var batteryTimer: Timer?
+    private var watchTimer: Timer?
+    private var ticks = 0
+    private let network = NetworkKeeper()
     private var signalSources: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -179,15 +233,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         handleTerminationSignals()
-        batteryTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            guard let self, self.mode != .off, batteryLow() else { return }
-            self.apply(.off)
-            self.statusItem.button?.toolTip = L.batteryNote
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            self?.watch()
         }
 
         // Last used mode (or `-mode N` on the command line, handy for testing).
         apply(Mode(rawValue: defaults.integer(forKey: "mode")) ?? .off, interactive: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.maybeAskForBeer() }
+    }
+
+    /// Every 10 s: keep the network up. Every 60 s: battery guard, and make sure
+    /// nothing turned `disablesleep` back off behind our back (seen on 2026-10-21).
+    private func watch() {
+        guard mode != .off else { return }
+        network.check()
+        ticks += 1
+        guard ticks % 6 == 0 else { return }
+        if batteryLow() {
+            apply(.off)
+            statusItem.button?.toolTip = L.batteryNote
+            return
+        }
+        if mode == .lidClosed && !sleep.sleepDisabled {
+            let ok = sleep.setDisableSleep(true)
+            logger.notice("disablesleep was off, turned it back on (ok: \(ok, privacy: .public))")
+        }
     }
 
     func applicationWillTerminate(_ note: Notification) {
